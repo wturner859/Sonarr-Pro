@@ -79,7 +79,7 @@ namespace NzbDrone.Core.MetadataSource.Tvdb
         {
             var orderings = new List<EpisodeOrdering>();
 
-            if (tvdbId <= 0 || _config_service.TvdbApiKey.IsNullOrWhiteSpace())
+            if (tvdbId <= 0 || _configService.TvdbApiKey.IsNullOrWhiteSpace())
             {
                 return orderings;
             }
@@ -173,7 +173,7 @@ namespace NzbDrone.Core.MetadataSource.Tvdb
         {
             var seasonType = TvdbOrderingIds.ToSeasonType(orderingId);
 
-            return _episode_cache.Get($"{tvdbId}:{seasonType}", () => FetchEpisodes(tvdbId, seasonType), EpisodeLifetime);
+            return _episodeCache.Get($"{tvdbId}:{seasonType}", () => FetchEpisodes(tvdbId, seasonType), EpisodeLifetime);
         }
 
         private List<TvdbEpisodeResource> FetchEpisodes(int tvdbId, string seasonType)
@@ -221,7 +221,7 @@ namespace NzbDrone.Core.MetadataSource.Tvdb
         private T Get<T>(string resource, int page, bool isRetry = false)
             where T : class, new()
         {
-            var apiKey = _config_service.TvdbApiKey;
+            var apiKey = _configService.TvdbApiKey;
 
             if (apiKey.IsNullOrWhiteSpace())
             {
@@ -230,7 +230,7 @@ namespace NzbDrone.Core.MetadataSource.Tvdb
 
             var request = new HttpRequestBuilder(BaseUrl + resource)
                 .AddQueryParam("page", page.ToString())
-                .SetHeader("Authorization", "Bearer " + GetToken(apiKey, _config_service.TvdbPin))
+                .SetHeader("Authorization", "Bearer " + GetToken(apiKey, _configService.TvdbPin))
                 .Build();
 
             request.AllowAutoRedirect = true;
@@ -248,7 +248,7 @@ namespace NzbDrone.Core.MetadataSource.Tvdb
                 if (response.StatusCode == HttpStatusCode.Unauthorized && !isRetry)
                 {
                     // The cached token has expired or been revoked. Log in afresh once.
-                    _token_cache.Remove(TokenCacheKey(apiKey, _config_service.TvdbPin));
+                    _tokenCache.Remove(TokenCacheKey(apiKey, _configService.TvdbPin));
 
                     return Get<T>(resource, page, true);
                 }
@@ -266,7 +266,7 @@ namespace NzbDrone.Core.MetadataSource.Tvdb
 
         private string GetToken(string apiKey, string pin)
         {
-            return _token_cache.Get(TokenCacheKey(apiKey, pin), () => Login(apiKey, pin), TokenLifetime);
+            return _tokenCache.Get(TokenCacheKey(apiKey, pin), () => Login(apiKey, pin), TokenLifetime);
         }
 
         // Keyed by the key and PIN themselves so changing either in Settings does not keep
@@ -295,9 +295,9 @@ namespace NzbDrone.Core.MetadataSource.Tvdb
             if (response.HasHttpError)
             {
                 if (response.StatusCode == HttpStatusCode.Unauthorized)
-            {
-                throw new TvdbApiKeyMissingException("The configured TheTVDB API key was rejected");
-            }
+                {
+                    throw new TvdbApiKeyMissingException("The configured TheTVDB API key was rejected");
+                }
 
                 throw new HttpException(request, response);
             }

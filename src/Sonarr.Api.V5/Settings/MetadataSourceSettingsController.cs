@@ -41,6 +41,20 @@ public class MetadataSourceSettingsController : SettingsController<MetadataSourc
                 : resource.TmdbApiKey.Trim();
         }
 
+        if (resource.TvdbApiKey != MetadataSourceSettingsResource.Mask)
+        {
+            _configService.TvdbApiKey = resource.TvdbApiKey.IsNullOrWhiteSpace()
+                ? string.Empty
+                : resource.TvdbApiKey.Trim();
+        }
+
+        if (resource.TvdbPin != MetadataSourceSettingsResource.Mask)
+        {
+            _configService.TvdbPin = resource.TvdbPin.IsNullOrWhiteSpace()
+                ? string.Empty
+                : resource.TvdbPin.Trim();
+        }
+
         return TypedAccepted(resource.Id);
     }
 }

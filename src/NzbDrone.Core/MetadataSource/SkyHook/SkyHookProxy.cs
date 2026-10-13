@@ -13,6 +13,7 @@ using NzbDrone.Core.Exceptions;
 using NzbDrone.Core.Languages;
 using NzbDrone.Core.MediaCover;
 using NzbDrone.Core.MetadataSource.SkyHook.Resource;
+using NzbDrone.Core.MetadataSource.Tvdb;
 using NzbDrone.Core.Parser;
 using NzbDrone.Core.Tv;
 
@@ -27,11 +28,13 @@ namespace NzbDrone.Core.MetadataSource.SkyHook
         private readonly ISeriesService _seriesService;
         private readonly IDailySeriesService _dailySeriesService;
         private readonly IHttpRequestBuilderFactory _requestBuilder;
+        private readonly IProvideTvdbOrdering _tvdbOrdering;
 
         public SkyHookProxy(IHttpClient httpClient,
                             ISonarrCloudRequestBuilder requestBuilder,
                             ISeriesService seriesService,
                             IDailySeriesService dailySeriesService,
+                            IProvideTvdbOrdering tvdbOrdering,
                             Logger logger)
         {
             _httpClient = httpClient;
@@ -39,12 +42,54 @@ namespace NzbDrone.Core.MetadataSource.SkyHook
             _logger = logger;
             _seriesService = seriesService;
             _dailySeriesService = dailySeriesService;
+            _tvdbOrdering = tvdbOrdering;
             _requestBuilder = requestBuilder.SkyHookTvdb;
         }
 
         public Tuple<Series, List<Episode>> GetSeriesInfo(Series series)
         {
-            return GetSeriesInfo(series.TvdbId);
+            var tuple = GetSeriesInfo(series.TvdbId);
+
+            // SkyHook only publishes the aired order. A series added with one of TheTVDB's
+            // other orders is renumbered here, on add and on every refresh, so its episodes
+            // keep the numbering its files were named with.
+            if (TvdbOrderingIds.IsTvdbOrdering(series.OrderingId))
+            {
+                var episodes = _tvdbOrdering.ApplyOrdering(series.OrderingId, series.TvdbId, tuple.Item2);
+
+                tuple.Item1.OrderingId = series.OrderingId;
+                SetSeasons(tuple.Item1, episodes);
+
+                return new Tuple<Series, List<Episode>>(tuple.Item1, episodes);
+            }
+
+            return tuple;
+        }
+
+        /// <summary>
+        /// Rebuilds the season list from the renumbered episodes, since the seasons SkyHook
+        /// returned describe the aired order. A season that survives keeps whatever monitored
+        /// state it was given, and new ones are monitored unless they are specials.
+        /// </summary>
+        private static void SetSeasons(Series series, List<Episode> episodes)
+        {
+            var existing = series.Seasons?.ToDictionary(s => s.SeasonNumber) ?? new Dictionary<int, Season>();
+
+            series.Seasons = episodes.Select(e => e.SeasonNumber)
+                                     .Distinct()
+                                     .OrderBy(number => number)
+                                     .Select(number =>
+                                     {
+                                         var found = existing.TryGetValue(number, out var previous);
+
+                                         return new Season
+                                         {
+                                             SeasonNumber = number,
+                                             Images = found ? previous.Images : new List<MediaCover.MediaCover>(),
+                                             Monitored = found ? previous.Monitored : number > 0
+                                         };
+                                     })
+                                     .ToList();
         }
 
         public Tuple<Series, List<Episode>> GetSeriesInfo(int tvdbSeriesId)

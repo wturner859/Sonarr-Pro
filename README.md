@@ -26,9 +26,9 @@ Sonarr Pro keeps everything upstream does and adds a way around each of those.
 
 ## What's added
 
-**Four metadata sources, picked per series** — TheTVDB, TMDB, AniList, and MyAnimeList (via Jikan), chosen from a dropdown above the search box when adding a series. Only TMDB needs a key; the rest need no account.
+**Four metadata sources, picked per series** — TheTVDB, TMDB, AniList, and MyAnimeList (via Jikan), chosen from a dropdown above the search box when adding a series. TMDB needs a key, and TheTVDB needs one only for its alternate episode orders; the rest need no account.
 
-**Selectable episode orderings** — TMDB publishes alternate numbering schemes per series, and IMDb's dumps carry another. Where a series has more than one, you pick at add time. The one that motivates this is TMDB's *Absolute* order: One Piece becomes season 1, episodes 1–1181, instead of twenty-odd seasons. DVD order, story arcs and streaming orders come along for free.
+**Selectable episode orderings** — TMDB publishes alternate numbering schemes per series, IMDb's dumps carry another, and TheTVDB's own absolute and alternate orders are available with a TheTVDB API key. Where a series has more than one, you pick at add time. The one that motivates this is TMDB's *Absolute* order: One Piece becomes season 1, episodes 1–1181, instead of twenty-odd seasons. DVD order, story arcs and streaming orders come along for free.
 
 **Series TheTVDB won't list separately** — recuts and spin-offs that TheTVDB folds into a parent series can be added from TMDB or AniList. Upstream can't add these at all.
 
@@ -126,6 +126,8 @@ The config directory layout is unchanged, so pointing Sonarr Pro's `/config` at 
 ## First-run setup
 
 **Add a TMDB API key** if you want TMDB metadata or episode groups — Settings → Metadata Source. It's free from [themoviedb.org](https://www.themoviedb.org/settings/api). Nothing else needs a key, and the other three sources work without it.
+
+**Add a TheTVDB API key** if you want TheTVDB's absolute and alternate episode orders for a series — Settings → Metadata Source. Without one, TheTVDB series use the aired order as before. A user-supported key also needs its PIN.
 
 **Build the IMDb index** if you want IMDb orderings — System → Tasks → *Refresh Imdb Dataset*. It downloads about 52 MB once, then keeps itself current monthly. Until it runs, IMDb simply doesn't appear in the ordering dropdown.
 

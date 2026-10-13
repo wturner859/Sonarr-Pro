@@ -32,6 +32,8 @@ namespace NzbDrone.Core.Configuration
 
         // Metadata
         string TmdbApiKey { get; set; }
+        string TvdbApiKey { get; set; }
+        string TvdbPin { get; set; }
 
         // Media Management
         bool AutoUnmonitorPreviouslyDownloadedEpisodes { get; set; }

@@ -1,0 +1,1809 @@
+From 7ecf8b61dc44374d3cb1426903721232ae8ffe70 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 00:49:56 -0400
+Subject: [PATCH] Add TheTVDB absolute and alternate episode orders
+
+SkyHook only publishes TheTVDB's aired order. With a TheTVDB v4 API key
+(and PIN, for a user-supported key) saved, a series TheTVDB owns can now be
+added with TheTVDB's absolute or alternate order, alongside the default
+aired order, in the existing ordering dropdown.
+
+- New Tvdb provider: v4 login with token caching and one retry on 401,
+  paginated season-type fetch, 404 treated as "no such order".
+- TvdbOrderingProjector renumbers SkyHook episodes by TheTVDB episode id.
+  Unlisted episodes are kept; ones that would collide move to season 0.
+- SkyHookProxy applies the ordering on add and refresh and rebuilds seasons.
+  A vanished ordering throws rather than falling back to aired order.
+- GET series/ordering takes tvdbId; settings gain TvdbApiKey and TvdbPin,
+  masked like the TMDB key. Frontend settings and add dialog updated.
+
+Verification: not compiled and tests not run (no .NET SDK or NuGet access in
+the authoring environment). Frontend files parse and pass Prettier, but were
+not typechecked. Not exercised against the live TheTVDB API.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014WxAKXd9SdymV8hnMM8qcJ
+---
+ FORK.md                                       |  27 +-
+ README.md                                     |   6 +-
+ .../AddNewSeries/AddNewSeriesModalContent.tsx |  11 +-
+ .../AddNewSeries/useEpisodeOrderings.ts       |  17 +-
+ .../src/Settings/MetadataSource/ApiKeys.tsx   | 127 +++++++
+ .../MetadataSource/MetadataSourceSettings.tsx |   4 +-
+ frontend/src/Settings/MetadataSource/Tmdb.tsx |  88 -----
+ .../useMetadataSourceSettings.ts              |   9 +
+ .../Tvdb/TvdbOrderingProjectorFixture.cs      | 227 +++++++++++++
+ .../Tvdb/TvdbOrderingProviderFixture.cs       | 223 +++++++++++++
+ .../Configuration/ConfigService.cs            |  14 +
+ .../Configuration/IConfigService.cs           |   2 +
+ src/NzbDrone.Core/Localization/Core/en.json   |   6 +-
+ .../MetadataSource/SkyHook/SkyHookProxy.cs    |  47 ++-
+ .../Tvdb/Resource/TvdbResources.cs            |  57 ++++
+ .../Tvdb/TvdbApiKeyMissingException.cs        |  17 +
+ .../MetadataSource/Tvdb/TvdbOrderingIds.cs    |  51 +++
+ .../Tvdb/TvdbOrderingProjector.cs             | 105 ++++++
+ .../Tvdb/TvdbOrderingProvider.cs              | 312 ++++++++++++++++++
+ .../Tvdb/TvdbOrderingUnavailableException.cs  |  17 +
+ .../Series/EpisodeOrderingController.cs       |  24 +-
+ .../MetadataSourceSettingsController.cs       |  14 +
+ .../MetadataSourceSettingsResource.cs         |  25 +-
+ 23 files changed, 1326 insertions(+), 104 deletions(-)
+ create mode 100644 frontend/src/Settings/MetadataSource/ApiKeys.tsx
+ delete mode 100644 frontend/src/Settings/MetadataSource/Tmdb.tsx
+ create mode 100644 src/NzbDrone.Core.Test/MetadataSource/Tvdb/TvdbOrderingProjectorFixture.cs
+ create mode 100644 src/NzbDrone.Core.Test/MetadataSource/Tvdb/TvdbOrderingProviderFixture.cs
+ create mode 100644 src/NzbDrone.Core/MetadataSource/Tvdb/Resource/TvdbResources.cs
+ create mode 100644 src/NzbDrone.Core/MetadataSource/Tvdb/TvdbApiKeyMissingException.cs
+ create mode 100644 src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingIds.cs
+ create mode 100644 src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingProjector.cs
+ create mode 100644 src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingProvider.cs
+ create mode 100644 src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingUnavailableException.cs
+
+diff --git a/FORK.md b/FORK.md
+index 9e136f8..d12ef37 100644
+--- a/FORK.md
++++ b/FORK.md
+@@ -17,7 +17,7 @@ preserve the fork's existing migrations 233–235.
+ 
+ ## Turn-on checklist
+ 
+-Three things need doing before the new features do anything.
++Four things need doing before the new features do anything.
+ 
+ 1. **TMDB API key** — Settings → Metadata Source. Free from
+    <https://www.themoviedb.org/settings/api>. Without it, TMDB metadata and
+@@ -29,6 +29,9 @@ Three things need doing before the new features do anything.
+    ever happens because someone asked for it.
+ 3. **Skip Unmonitored Episodes In Packs** — Settings → Media Management, off by
+    default. See below for why.
++4. **TheTVDB API key** (optional) — Settings → Metadata Source. Only needed for
++   TheTVDB's absolute and alternate orders. A user-supported key also needs its
++   PIN. Without a key the ordering dropdown simply does not list them.
+ 
+ Nothing else needs configuring.
+ 
+@@ -108,6 +111,28 @@ Episodes an ordering does not mention keep their original numbering rather than
+ being dropped, so nothing already matched to a file is lost. For One Piece that
+ is 39 specials, kept in season 0.
+ 
++### TheTVDB's own orders
++
++SkyHook, the proxy behind the default TheTVDB lookup, only publishes the aired
++order. TheTVDB itself also keeps *absolute* and *alternate* season types, which
++are only reachable through its v4 API and a key of the user's own. With a key
++saved, a series TheTVDB owns gets those two added to the dropdown, next to the
++default aired order, whenever TheTVDB actually lists episodes for them.
++
++They are applied inside `SkyHookProxy`, on add and on every refresh, by laying
++TheTVDB's numbering over the SkyHook episodes by TheTVDB episode id. Two
++deliberate differences from the TMDB path:
++
++- **A vanished ordering is an error, not a fallback.** If TheTVDB stops listing
++  the order a series was added with, the refresh fails and the library keeps its
++  numbering. Falling back to aired order would rename it.
++- **An unlisted episode that would share a slot with a listed one moves to the
++  end of season 0.** It is never dropped and never duplicated: two episodes with
++  the same season and episode number break matching on the next refresh.
++
++These orderings are only offered for series TheTVDB owns, because the TheTVDB
++provider is what applies them.
++
+ ---
+ 
+ ## Downloading
+diff --git a/README.md b/README.md
+index db7b303..254b7a0 100644
+--- a/README.md
++++ b/README.md
+@@ -26,9 +26,9 @@ Sonarr Pro keeps everything upstream does and adds a way around each of those.
+ 
+ ## What's added
+ 
+-**Four metadata sources, picked per series** — TheTVDB, TMDB, AniList, and MyAnimeList (via Jikan), chosen from a dropdown above the search box when adding a series. Only TMDB needs a key; the rest need no account.
++**Four metadata sources, picked per series** — TheTVDB, TMDB, AniList, and MyAnimeList (via Jikan), chosen from a dropdown above the search box when adding a series. TMDB needs a key, and TheTVDB needs one only for its alternate episode orders; the rest need no account.
+ 
+-**Selectable episode orderings** — TMDB publishes alternate numbering schemes per series, and IMDb's dumps carry another. Where a series has more than one, you pick at add time. The one that motivates this is TMDB's *Absolute* order: One Piece becomes season 1, episodes 1–1181, instead of twenty-odd seasons. DVD order, story arcs and streaming orders come along for free.
++**Selectable episode orderings** — TMDB publishes alternate numbering schemes per series, IMDb's dumps carry another, and TheTVDB's own absolute and alternate orders are available with a TheTVDB API key. Where a series has more than one, you pick at add time. The one that motivates this is TMDB's *Absolute* order: One Piece becomes season 1, episodes 1–1181, instead of twenty-odd seasons. DVD order, story arcs and streaming orders come along for free.
+ 
+ **Series TheTVDB won't list separately** — recuts and spin-offs that TheTVDB folds into a parent series can be added from TMDB or AniList. Upstream can't add these at all.
+ 
+@@ -127,6 +127,8 @@ The config directory layout is unchanged, so pointing Sonarr Pro's `/config` at
+ 
+ **Add a TMDB API key** if you want TMDB metadata or episode groups — Settings → Metadata Source. It's free from [themoviedb.org](https://www.themoviedb.org/settings/api). Nothing else needs a key, and the other three sources work without it.
+ 
++**Add a TheTVDB API key** if you want TheTVDB's absolute and alternate episode orders for a series — Settings → Metadata Source. Without one, TheTVDB series use the aired order as before. A user-supported key also needs its PIN.
++
+ **Build the IMDb index** if you want IMDb orderings — System → Tasks → *Refresh Imdb Dataset*. It downloads about 52 MB once, then keeps itself current monthly. Until it runs, IMDb simply doesn't appear in the ordering dropdown.
+ 
+ One thing worth knowing before you add a long series: **the episode ordering is fixed when the series is added.** Season and episode numbers go into file and folder names, so changing it afterwards would rename your library on disk. To change it, remove the series and add it again.
+diff --git a/frontend/src/AddSeries/AddNewSeries/AddNewSeriesModalContent.tsx b/frontend/src/AddSeries/AddNewSeries/AddNewSeriesModalContent.tsx
+index eb609b5..2feea67 100644
+--- a/frontend/src/AddSeries/AddNewSeries/AddNewSeriesModalContent.tsx
++++ b/frontend/src/AddSeries/AddNewSeries/AddNewSeriesModalContent.tsx
+@@ -69,7 +69,16 @@ function AddNewSeriesModalContent({
+   // translated back on submit.
+   const [orderingId, setOrderingId] = useState('');
+ 
+-  const { data: orderings } = useEpisodeOrderings(series.tmdbId, series.imdbId);
++  // A series added without a metadata source is a TheTVDB one. Series owned by another
++  // source carry a placeholder (zero or negative) TheTVDB id when TheTVDB has no entry.
++  const isTvdbSeries =
++    !series.metadataSource || series.metadataSource.toLowerCase() === 'tvdb';
++
++  const { data: orderings } = useEpisodeOrderings(
++    series.tmdbId,
++    series.imdbId,
++    isTvdbSeries ? Math.max(series.tvdbId, 0) : 0
++  );
+ 
+   const orderingOptions = useMemo(() => {
+     return orderings.map((ordering) => ({
+diff --git a/frontend/src/AddSeries/AddNewSeries/useEpisodeOrderings.ts b/frontend/src/AddSeries/AddNewSeries/useEpisodeOrderings.ts
+index 6fd4f9d..997a8a7 100644
+--- a/frontend/src/AddSeries/AddNewSeries/useEpisodeOrderings.ts
++++ b/frontend/src/AddSeries/AddNewSeries/useEpisodeOrderings.ts
+@@ -13,20 +13,26 @@ export interface EpisodeOrdering {
+ const DEFAULT_ORDERINGS: EpisodeOrdering[] = [];
+ 
+ /**
+- * Episode orderings published for a series: TMDB episode groups, and IMDb's own
+- * numbering once the local IMDb index has been built.
++ * Episode orderings published for a series: TMDB episode groups, IMDb's own
++ * numbering once the local IMDb index has been built, and TheTVDB's absolute and
++ * alternate orders once a TheTVDB API key is saved.
+  *
+- * Both ids are sent because they are answered by different sources. A series known
++ * The ids are sent because they are answered by different sources. A series known
+  * to IMDb but not TMDB still has an ordering to offer, and asking only about TMDB
+  * would hide it.
+  *
++ * Pass a TheTVDB id only for a series TheTVDB owns: those orderings are applied by
++ * the TheTVDB provider, so offering them for a series owned by another source would
++ * be a choice that does nothing.
++ *
+  * An empty list means the series is added with the provider's default ordering,
+  * which is the normal case for a series with nothing published and for an install
+- * with no TMDB key.
++ * with no keys saved.
+  */
+ export const useEpisodeOrderings = (
+   tmdbId: number,
+   imdbId?: string,
++  tvdbId = 0,
+   isEnabled = true
+ ) => {
+   const result = useApiQuery<EpisodeOrdering[]>({
+@@ -34,9 +40,10 @@ export const useEpisodeOrderings = (
+     queryParams: {
+       tmdbId,
+       imdbId,
++      tvdbId,
+     },
+     queryOptions: {
+-      enabled: isEnabled && (tmdbId > 0 || !!imdbId),
++      enabled: isEnabled && (tmdbId > 0 || !!imdbId || tvdbId > 0),
+       refetchOnWindowFocus: false,
+     },
+   });
+diff --git a/frontend/src/Settings/MetadataSource/ApiKeys.tsx b/frontend/src/Settings/MetadataSource/ApiKeys.tsx
+new file mode 100644
+index 0000000..acd0e70
+--- /dev/null
++++ b/frontend/src/Settings/MetadataSource/ApiKeys.tsx
+@@ -0,0 +1,127 @@
++import React, { useCallback, useEffect } from 'react';
++import Alert from 'Components/Alert';
++import FieldSet from 'Components/FieldSet';
++import Form from 'Components/Form/Form';
++import FormInput from 'Components/Form/FormInput';
++import FormInputHelpText from 'Components/Form/FormInputHelpText';
++import FormLabel from 'Components/Form/FormLabel';
++import FormRow from 'Components/Form/FormRow';
++import LoadingIndicator from 'Components/Loading/LoadingIndicator';
++import { inputTypes, kinds } from 'Helpers/Props';
++import { InputChanged } from 'typings/inputs';
++import {
++  OnChildStateChange,
++  SetChildSave,
++} from 'typings/Settings/SettingsState';
++import translate from 'Utilities/String/translate';
++import { useManageMetadataSourceSettings } from './useMetadataSourceSettings';
++
++interface ApiKeysProps {
++  setChildSave: SetChildSave;
++  onChildStateChange: OnChildStateChange;
++}
++
++function ApiKeys({ setChildSave, onChildStateChange }: ApiKeysProps) {
++  const {
++    isFetching,
++    isFetched,
++    isSaving,
++    error,
++    settings,
++    hasSettings,
++    hasPendingChanges,
++    saveSettings,
++    updateSetting,
++  } = useManageMetadataSourceSettings();
++
++  const handleInputChange = useCallback(
++    ({ name, value }: InputChanged) => {
++      // @ts-expect-error - InputChanged name/value are not typed as keyof MetadataSourceSettingsModel
++      updateSetting(name, value);
++    },
++    [updateSetting]
++  );
++
++  useEffect(() => {
++    setChildSave(saveSettings);
++  }, [saveSettings, setChildSave]);
++
++  useEffect(() => {
++    onChildStateChange({
++      isSaving,
++      hasPendingChanges,
++    });
++  }, [hasPendingChanges, isSaving, onChildStateChange]);
++
++  // Both keys sit on one page with one Save button, so they share a single settings
++  // instance: pending changes are held per instance, and only one save is registered.
++  const showForm = hasSettings && isFetched && !error;
++
++  return (
++    <>
++      <FieldSet legend={translate('Tmdb')}>
++        {isFetching ? <LoadingIndicator /> : null}
++
++        {!isFetching && error ? (
++          <Alert kind={kinds.DANGER}>
++            {translate('MetadataSourceSettingsLoadError')}
++          </Alert>
++        ) : null}
++
++        {showForm ? (
++          <Form>
++            <FormRow>
++              <FormLabel>{translate('TmdbApiKey')}</FormLabel>
++
++              <FormInputHelpText
++                text={translate('TmdbApiKeyHelpText')}
++                link="https://www.themoviedb.org/settings/api"
++              />
++              <FormInput
++                type={inputTypes.PASSWORD}
++                name="tmdbApiKey"
++                onChange={handleInputChange}
++                {...settings.tmdbApiKey}
++              />
++            </FormRow>
++          </Form>
++        ) : null}
++      </FieldSet>
++
++      {showForm ? (
++        <FieldSet legend={translate('TheTvdb')}>
++          <Form>
++            <FormRow>
++              <FormLabel>{translate('TvdbApiKey')}</FormLabel>
++
++              <FormInputHelpText
++                text={translate('TvdbApiKeyHelpText')}
++                link="https://thetvdb.com/api-information"
++              />
++              <FormInput
++                type={inputTypes.PASSWORD}
++                name="tvdbApiKey"
++                onChange={handleInputChange}
++                {...settings.tvdbApiKey}
++              />
++            </FormRow>
++
++            <FormRow>
++              <FormLabel>{translate('TvdbPin')}</FormLabel>
++
++              <FormInputHelpText text={translate('TvdbPinHelpText')} />
++              <FormInput
++                type={inputTypes.PASSWORD}
++                name="tvdbPin"
++                onChange={handleInputChange}
++                {...settings.tvdbPin}
++              />
++            </FormRow>
++          </Form>
++        </FieldSet>
++      ) : null}
++    </>
++  );
++}
++
++export default ApiKeys;
+diff --git a/frontend/src/Settings/MetadataSource/MetadataSourceSettings.tsx b/frontend/src/Settings/MetadataSource/MetadataSourceSettings.tsx
+index e69ee84..ce8ed2d 100644
+--- a/frontend/src/Settings/MetadataSource/MetadataSourceSettings.tsx
++++ b/frontend/src/Settings/MetadataSource/MetadataSourceSettings.tsx
+@@ -7,8 +7,8 @@ import {
+   SettingsStateChange,
+ } from 'typings/Settings/SettingsState';
+ import translate from 'Utilities/String/translate';
++import ApiKeys from './ApiKeys';
+ import Sources from './Sources';
+-import Tmdb from './Tmdb';
+ 
+ function MetadataSourceSettings() {
+   const saveOptions = useRef<() => void>();
+@@ -46,7 +46,7 @@ function MetadataSourceSettings() {
+         />
+         <Sources />
+ 
+-        <Tmdb
++        <ApiKeys
+           setChildSave={handleSetChildSave}
+           onChildStateChange={handleChildStateChange}
+         />
+diff --git a/frontend/src/Settings/MetadataSource/Tmdb.tsx b/frontend/src/Settings/MetadataSource/Tmdb.tsx
+deleted file mode 100644
+index 963dc3e..0000000
+--- a/frontend/src/Settings/MetadataSource/Tmdb.tsx
++++ /dev/null
+@@ -1,88 +0,0 @@
+-import React, { useCallback, useEffect } from 'react';
+-import Alert from 'Components/Alert';
+-import FieldSet from 'Components/FieldSet';
+-import Form from 'Components/Form/Form';
+-import FormInput from 'Components/Form/FormInput';
+-import FormInputHelpText from 'Components/Form/FormInputHelpText';
+-import FormLabel from 'Components/Form/FormLabel';
+-import FormRow from 'Components/Form/FormRow';
+-import LoadingIndicator from 'Components/Loading/LoadingIndicator';
+-import { inputTypes, kinds } from 'Helpers/Props';
+-import { InputChanged } from 'typings/inputs';
+-import {
+-  OnChildStateChange,
+-  SetChildSave,
+-} from 'typings/Settings/SettingsState';
+-import translate from 'Utilities/String/translate';
+-import { useManageMetadataSourceSettings } from './useMetadataSourceSettings';
+-
+-interface TmdbProps {
+-  setChildSave: SetChildSave;
+-  onChildStateChange: OnChildStateChange;
+-}
+-
+-function Tmdb({ setChildSave, onChildStateChange }: TmdbProps) {
+-  const {
+-    isFetching,
+-    isFetched,
+-    isSaving,
+-    error,
+-    settings,
+-    hasSettings,
+-    hasPendingChanges,
+-    saveSettings,
+-    updateSetting,
+-  } = useManageMetadataSourceSettings();
+-
+-  const handleInputChange = useCallback(
+-    ({ name, value }: InputChanged) => {
+-      // @ts-expect-error - InputChanged name/value are not typed as keyof MetadataSourceSettingsModel
+-      updateSetting(name, value);
+-    },
+-    [updateSetting]
+-  );
+-
+-  useEffect(() => {
+-    setChildSave(saveSettings);
+-  }, [saveSettings, setChildSave]);
+-
+-  useEffect(() => {
+-    onChildStateChange({
+-      isSaving,
+-      hasPendingChanges,
+-    });
+-  }, [hasPendingChanges, isSaving, onChildStateChange]);
+-
+-  return (
+-    <FieldSet legend={translate('Tmdb')}>
+-      {isFetching ? <LoadingIndicator /> : null}
+-
+-      {!isFetching && error ? (
+-        <Alert kind={kinds.DANGER}>
+-          {translate('MetadataSourceSettingsLoadError')}
+-        </Alert>
+-      ) : null}
+-
+-      {hasSettings && isFetched && !error ? (
+-        <Form>
+-          <FormRow>
+-            <FormLabel>{translate('TmdbApiKey')}</FormLabel>
+-
+-            <FormInputHelpText
+-              text={translate('TmdbApiKeyHelpText')}
+-              link="https://www.themoviedb.org/settings/api"
+-            />
+-            <FormInput
+-              type={inputTypes.PASSWORD}
+-              name="tmdbApiKey"
+-              onChange={handleInputChange}
+-              {...settings.tmdbApiKey}
+-            />
+-          </FormRow>
+-        </Form>
+-      ) : null}
+-    </FieldSet>
+-  );
+-}
+-
+-export default Tmdb;
+diff --git a/frontend/src/Settings/MetadataSource/useMetadataSourceSettings.ts b/frontend/src/Settings/MetadataSource/useMetadataSourceSettings.ts
+index eaff66c..ca063aa 100644
+--- a/frontend/src/Settings/MetadataSource/useMetadataSourceSettings.ts
++++ b/frontend/src/Settings/MetadataSource/useMetadataSourceSettings.ts
+@@ -7,6 +7,15 @@ export interface MetadataSourceSettingsModel {
+    */
+   tmdbApiKey: string;
+   tmdbApiKeyConfigured: boolean;
++
++  /**
++   * TheTVDB v4 key and, for a user-supported key, its PIN. Only needed for TheTVDB's
++   * absolute and alternate orders. Masked once saved, like the TMDB key.
++   */
++  tvdbApiKey: string;
++  tvdbApiKeyConfigured: boolean;
++  tvdbPin: string;
++  tvdbPinConfigured: boolean;
+ }
+ 
+ const PATH = '/settings/metadatasource';
+diff --git a/src/NzbDrone.Core.Test/MetadataSource/Tvdb/TvdbOrderingProjectorFixture.cs b/src/NzbDrone.Core.Test/MetadataSource/Tvdb/TvdbOrderingProjectorFixture.cs
+new file mode 100644
+index 0000000..ef1e4b8
+--- /dev/null
++++ b/src/NzbDrone.Core.Test/MetadataSource/Tvdb/TvdbOrderingProjectorFixture.cs
+@@ -0,0 +1,227 @@
++using System.Collections.Generic;
++using System.Linq;
++using FluentAssertions;
++using NUnit.Framework;
++using NzbDrone.Core.MetadataSource.Tvdb;
++using NzbDrone.Core.MetadataSource.Tvdb.Resource;
++using NzbDrone.Core.Test.Framework;
++using NzbDrone.Core.Tv;
++
++namespace NzbDrone.Core.Test.MetadataSource.Tvdb
++{
++    [TestFixture]
++    public class TvdbOrderingProjectorFixture : CoreTest
++    {
++        private static Episode Episode(int tvdbId, int season, int number)
++        {
++            return new Episode
++            {
++                TvdbId = tvdbId,
++                SeasonNumber = season,
++                EpisodeNumber = number,
++                Title = $"S{season}E{number}"
++            };
++        }
++
++        private static TvdbEpisodeResource Listed(int tvdbId, int season, int number, int? absolute = null)
++        {
++            return new TvdbEpisodeResource
++            {
++                Id = tvdbId,
++                SeasonNumber = season,
++                Number = number,
++                AbsoluteNumber = absolute
++            };
++        }
++
++        [Test]
++        public void should_renumber_episodes_into_the_alternate_order()
++        {
++            var a = Episode(1, 1, 1);
++            var b = Episode(2, 1, 2);
++            var c = Episode(3, 2, 1);
++
++            var result = TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Alternate,
++                new[] { Listed(3, 1, 1), Listed(1, 1, 2), Listed(2, 1, 3) },
++                new List<Episode> { a, b, c });
++
++            a.SeasonNumber.Should().Be(1);
++            a.EpisodeNumber.Should().Be(2);
++            b.SeasonNumber.Should().Be(1);
++            b.EpisodeNumber.Should().Be(3);
++            c.SeasonNumber.Should().Be(1);
++            c.EpisodeNumber.Should().Be(1);
++
++            // The caller's order is preserved, so renumbering does not reshuffle the list.
++            result.Should().Equal(a, b, c);
++        }
++
++        [Test]
++        public void should_number_an_absolute_order_as_one_run_in_season_one()
++        {
++            var a = Episode(1, 1, 1);
++            var b = Episode(2, 2, 1);
++            var c = Episode(3, 2, 2);
++
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Absolute,
++                new[] { Listed(1, 1, 1, 1), Listed(2, 1, 2, 2), Listed(3, 1, 3, 3) },
++                new List<Episode> { a, b, c });
++
++            new[] { a, b, c }.Should().OnlyContain(e => e.SeasonNumber == 1);
++            new[] { a, b, c }.Select(e => e.EpisodeNumber).Should().Equal(1, 2, 3);
++            new[] { a, b, c }.Select(e => e.AbsoluteEpisodeNumber).Should().Equal(1, 2, 3);
++        }
++
++        [Test]
++        public void should_use_the_listed_number_when_an_absolute_order_has_no_absolute_number()
++        {
++            var a = Episode(1, 3, 2);
++
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Absolute,
++                new[] { Listed(1, 1, 5, null) },
++                new List<Episode> { a });
++
++            a.SeasonNumber.Should().Be(1);
++            a.EpisodeNumber.Should().Be(5);
++            a.AbsoluteEpisodeNumber.Should().Be(5);
++        }
++
++        [Test]
++        public void should_keep_an_unlisted_episode_that_does_not_collide()
++        {
++            var a = Episode(1, 1, 1);
++            var special = Episode(2, 0, 1);
++
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Alternate,
++                new[] { Listed(1, 1, 1) },
++                new List<Episode> { a, special });
++
++            special.SeasonNumber.Should().Be(0);
++            special.EpisodeNumber.Should().Be(1);
++        }
++
++        [Test]
++        public void should_move_a_colliding_unlisted_episode_to_the_end_of_season_zero()
++        {
++            var a = Episode(1, 1, 1);
++            var b = Episode(2, 1, 2);
++            var special = Episode(3, 0, 1);
++            var unlisted = Episode(4, 1, 3);
++
++            // The order puts a into slot 1x3, which the unlisted episode already holds.
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Alternate,
++                new[] { Listed(1, 1, 3), Listed(2, 1, 1) },
++                new List<Episode> { a, b, special, unlisted });
++
++            a.SeasonNumber.Should().Be(1);
++            a.EpisodeNumber.Should().Be(3);
++            b.SeasonNumber.Should().Be(1);
++            b.EpisodeNumber.Should().Be(1);
++
++            // A real special is never displaced by the move.
++            special.SeasonNumber.Should().Be(0);
++            special.EpisodeNumber.Should().Be(1);
++
++            unlisted.SeasonNumber.Should().Be(0);
++            unlisted.EpisodeNumber.Should().Be(2);
++        }
++
++        [Test]
++        public void should_never_leave_two_episodes_in_the_same_slot()
++        {
++            var episodes = new List<Episode>
++            {
++                Episode(1, 1, 1),
++                Episode(2, 1, 2),
++                Episode(3, 1, 3),
++                Episode(4, 2, 1),
++                Episode(5, 0, 1)
++            };
++
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Alternate,
++                new[] { Listed(4, 1, 1), Listed(1, 1, 2) },
++                episodes);
++
++            episodes.Select(e => (e.SeasonNumber, e.EpisodeNumber)).Should().OnlyHaveUniqueItems();
++        }
++
++        [Test]
++        public void should_claim_an_episode_listed_twice_only_once()
++        {
++            var a = Episode(1, 1, 1);
++            var b = Episode(2, 1, 2);
++
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Alternate,
++                new[] { Listed(1, 1, 1), Listed(1, 1, 5) },
++                new List<Episode> { a, b });
++
++            a.SeasonNumber.Should().Be(1);
++            a.EpisodeNumber.Should().Be(1);
++            b.SeasonNumber.Should().Be(1);
++            b.EpisodeNumber.Should().Be(2);
++        }
++
++        [Test]
++        public void should_not_give_two_listed_episodes_the_same_slot()
++        {
++            var a = Episode(1, 1, 1);
++            var b = Episode(2, 1, 2);
++
++            // Both are listed for 1x1; the first keeps it and the second keeps what it had.
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Alternate,
++                new[] { Listed(1, 1, 1), Listed(2, 1, 1) },
++                new List<Episode> { a, b });
++
++            a.EpisodeNumber.Should().Be(1);
++            b.SeasonNumber.Should().Be(1);
++            b.EpisodeNumber.Should().Be(2);
++        }
++
++        [Test]
++        public void should_leave_an_episode_alone_when_it_is_listed_without_a_usable_number()
++        {
++            var a = Episode(1, 2, 4);
++
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Alternate,
++                new[] { Listed(1, 1, 0) },
++                new List<Episode> { a });
++
++            a.SeasonNumber.Should().Be(2);
++            a.EpisodeNumber.Should().Be(4);
++        }
++
++        [Test]
++        public void should_not_match_episodes_without_a_tvdb_id()
++        {
++            var a = Episode(0, 1, 1);
++
++            TvdbOrderingProjector.Project(
++                TvdbOrderingIds.Alternate,
++                new[] { Listed(0, 5, 5) },
++                new List<Episode> { a });
++
++            a.SeasonNumber.Should().Be(1);
++            a.EpisodeNumber.Should().Be(1);
++        }
++
++        [Test]
++        public void should_keep_every_episode_when_the_ordering_lists_nothing()
++        {
++            var episodes = new List<Episode> { Episode(1, 1, 1), Episode(2, 1, 2) };
++
++            var result = TvdbOrderingProjector.Project(TvdbOrderingIds.Alternate, new List<TvdbEpisodeResource>(), episodes);
++
++            result.Should().HaveCount(2);
++            result.Select(e => e.EpisodeNumber).Should().Equal(1, 2);
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core.Test/MetadataSource/Tvdb/TvdbOrderingProviderFixture.cs b/src/NzbDrone.Core.Test/MetadataSource/Tvdb/TvdbOrderingProviderFixture.cs
+new file mode 100644
+index 0000000..50e40d1
+--- /dev/null
++++ b/src/NzbDrone.Core.Test/MetadataSource/Tvdb/TvdbOrderingProviderFixture.cs
+@@ -0,0 +1,223 @@
++using System.Collections.Generic;
++using System.Linq;
++using System.Net;
++using FluentAssertions;
++using Moq;
++using NUnit.Framework;
++using NzbDrone.Common.Http;
++using NzbDrone.Core.Configuration;
++using NzbDrone.Core.MetadataSource.Tvdb;
++using NzbDrone.Core.MetadataSource.Tvdb.Resource;
++using NzbDrone.Core.Test.Framework;
++using NzbDrone.Core.Tv;
++
++namespace NzbDrone.Core.Test.MetadataSource.Tvdb
++{
++    [TestFixture]
++    public class TvdbOrderingProviderFixture : CoreTest<TvdbOrderingProvider>
++    {
++        private const string LoginJson = "{\"data\":{\"token\":\"test-token\"},\"status\":\"success\"}";
++
++        private const string AbsoluteJson = "{\"data\":{\"episodes\":[" +
++            "{\"id\":11,\"seasonNumber\":1,\"number\":1,\"absoluteNumber\":1}," +
++            "{\"id\":12,\"seasonNumber\":1,\"number\":2,\"absoluteNumber\":2}," +
++            "{\"id\":21,\"seasonNumber\":2,\"number\":1,\"absoluteNumber\":3}]},\"status\":\"success\"}";
++
++        private const string AlternateJson = "{\"data\":{\"episodes\":[" +
++            "{\"id\":21,\"seasonNumber\":1,\"number\":1}," +
++            "{\"id\":11,\"seasonNumber\":1,\"number\":2}]},\"status\":\"success\"}";
++
++        private const string EmptyJson = "{\"data\":{\"episodes\":[]},\"status\":\"success\"}";
++
++        private void GivenApiKey(string key = "api-key")
++        {
++            Mocker.GetMock<IConfigService>()
++                  .SetupGet(s => s.TvdbApiKey)
++                  .Returns(key);
++
++            Mocker.GetMock<IConfigService>()
++                  .SetupGet(s => s.TvdbPin)
++                  .Returns(string.Empty);
++        }
++
++        private void GivenLoginSucceeds()
++        {
++            Mocker.GetMock<IHttpClient>()
++                  .Setup(c => c.Post<TvdbLoginResponse>(It.IsAny<HttpRequest>()))
++                  .Returns((HttpRequest r) => new HttpResponse<TvdbLoginResponse>(new HttpResponse(r, new HttpHeader(), LoginJson)));
++        }
++
++        /// <summary>
++        /// Serves a season type's first page, and an empty page after it, as TheTVDB does
++        /// when a series has run out of episodes.
++        /// </summary>
++        private void GivenSeasonType(string seasonType, string firstPageJson, HttpStatusCode status = HttpStatusCode.OK)
++        {
++            Mocker.GetMock<IHttpClient>()
++                  .Setup(c => c.Get<TvdbEpisodesResponse>(It.Is<HttpRequest>(r => r.Url.FullUri.Contains($"/episodes/{seasonType}"))))
++                  .Returns((HttpRequest r) =>
++                  {
++                      var json = r.Url.FullUri.Contains("page=0") ? firstPageJson : EmptyJson;
++
++                      return new HttpResponse<TvdbEpisodesResponse>(new HttpResponse(r, new HttpHeader(), json, status));
++                  });
++        }
++
++        private static Episode Episode(int tvdbId, int season, int number)
++        {
++            return new Episode { TvdbId = tvdbId, SeasonNumber = season, EpisodeNumber = number };
++        }
++
++        [Test]
++        public void should_offer_nothing_without_an_api_key()
++        {
++            GivenApiKey(string.Empty);
++
++            Subject.GetOrderings(81189).Should().BeEmpty();
++
++            Mocker.GetMock<IHttpClient>().Verify(v => v.Post<TvdbLoginResponse>(It.IsAny<HttpRequest>()), Times.Never());
++        }
++
++        [Test]
++        public void should_offer_nothing_for_a_placeholder_series_id()
++        {
++            GivenApiKey();
++
++            Subject.GetOrderings(-5).Should().BeEmpty();
++            Subject.GetOrderings(0).Should().BeEmpty();
++        }
++
++        [Test]
++        public void should_offer_the_orders_thetvdb_lists_after_the_default()
++        {
++            GivenApiKey();
++            GivenLoginSucceeds();
++            GivenSeasonType("absolute", AbsoluteJson);
++            GivenSeasonType("alternate", AlternateJson);
++
++            var orderings = Subject.GetOrderings(81189);
++
++            orderings.Select(o => o.Id).Should().Equal(null, TvdbOrderingIds.Absolute, TvdbOrderingIds.Alternate);
++
++            var absolute = orderings.Single(o => o.Id == TvdbOrderingIds.Absolute);
++            absolute.IsAbsolute.Should().BeTrue();
++            absolute.EpisodeCount.Should().Be(3);
++            absolute.SeasonCount.Should().Be(1);
++
++            var alternate = orderings.Single(o => o.Id == TvdbOrderingIds.Alternate);
++            alternate.IsAbsolute.Should().BeFalse();
++            alternate.EpisodeCount.Should().Be(2);
++        }
++
++        [Test]
++        public void should_leave_out_an_order_thetvdb_does_not_have()
++        {
++            GivenApiKey();
++            GivenLoginSucceeds();
++            GivenSeasonType("absolute", string.Empty, HttpStatusCode.NotFound);
++            GivenSeasonType("alternate", AlternateJson);
++
++            Subject.GetOrderings(81189).Select(o => o.Id).Should().Equal(null, TvdbOrderingIds.Alternate);
++        }
++
++        [Test]
++        public void should_offer_no_choice_when_thetvdb_has_only_the_aired_order()
++        {
++            GivenApiKey();
++            GivenLoginSucceeds();
++            GivenSeasonType("absolute", string.Empty, HttpStatusCode.NotFound);
++            GivenSeasonType("alternate", string.Empty, HttpStatusCode.NotFound);
++
++            Subject.GetOrderings(81189).Should().BeEmpty();
++        }
++
++        [Test]
++        public void should_offer_nothing_instead_of_failing_when_the_key_is_rejected()
++        {
++            GivenApiKey();
++
++            Mocker.GetMock<IHttpClient>()
++                  .Setup(c => c.Post<TvdbLoginResponse>(It.IsAny<HttpRequest>()))
++                  .Returns((HttpRequest r) => new HttpResponse<TvdbLoginResponse>(new HttpResponse(r, new HttpHeader(), "{}", HttpStatusCode.Unauthorized)));
++
++            Subject.GetOrderings(81189).Should().BeEmpty();
++        }
++
++        [Test]
++        public void should_renumber_episodes_into_the_chosen_order()
++        {
++            GivenApiKey();
++            GivenLoginSucceeds();
++            GivenSeasonType("alternate", AlternateJson);
++
++            var a = Episode(11, 1, 1);
++            var b = Episode(21, 2, 1);
++
++            Subject.ApplyOrdering(TvdbOrderingIds.Alternate, 81189, new List<Episode> { a, b });
++
++            a.EpisodeNumber.Should().Be(2);
++            b.EpisodeNumber.Should().Be(1);
++        }
++
++        [Test]
++        public void should_log_in_again_once_when_the_cached_token_is_refused()
++        {
++            GivenApiKey();
++            GivenLoginSucceeds();
++
++            var request = new HttpRequest("https://api4.thetvdb.com/v4/series/81189/episodes/alternate?page=0");
++
++            Mocker.GetMock<IHttpClient>()
++                  .SetupSequence(c => c.Get<TvdbEpisodesResponse>(It.IsAny<HttpRequest>()))
++                  .Returns(new HttpResponse<TvdbEpisodesResponse>(new HttpResponse(request, new HttpHeader(), "{}", HttpStatusCode.Unauthorized)))
++                  .Returns(new HttpResponse<TvdbEpisodesResponse>(new HttpResponse(request, new HttpHeader(), AlternateJson)))
++                  .Returns(new HttpResponse<TvdbEpisodesResponse>(new HttpResponse(request, new HttpHeader(), EmptyJson)));
++
++            var a = Episode(11, 1, 1);
++
++            Subject.ApplyOrdering(TvdbOrderingIds.Alternate, 81189, new List<Episode> { a });
++
++            a.EpisodeNumber.Should().Be(2);
++
++            Mocker.GetMock<IHttpClient>().Verify(v => v.Post<TvdbLoginResponse>(It.IsAny<HttpRequest>()), Times.Exactly(2));
++        }
++
++        [Test]
++        public void should_not_touch_episodes_for_an_ordering_that_is_not_ours()
++        {
++            var a = Episode(11, 1, 1);
++
++            var result = Subject.ApplyOrdering("a1b2c3d4", 81189, new List<Episode> { a });
++
++            result.Should().ContainSingle().Which.Should().BeSameAs(a);
++            a.EpisodeNumber.Should().Be(1);
++
++            Mocker.GetMock<IHttpClient>().Verify(v => v.Post<TvdbLoginResponse>(It.IsAny<HttpRequest>()), Times.Never());
++        }
++
++        [Test]
++        public void should_refuse_to_fall_back_to_aired_order_when_the_ordering_has_gone()
++        {
++            GivenApiKey();
++            GivenLoginSucceeds();
++            GivenSeasonType("alternate", string.Empty, HttpStatusCode.NotFound);
++
++            var a = Episode(11, 1, 1);
++
++            Assert.Throws<TvdbOrderingUnavailableException>(() =>
++                Subject.ApplyOrdering(TvdbOrderingIds.Alternate, 81189, new List<Episode> { a }));
++
++            a.SeasonNumber.Should().Be(1);
++            a.EpisodeNumber.Should().Be(1);
++        }
++
++        [Test]
++        public void should_say_so_when_applying_an_ordering_without_an_api_key()
++        {
++            GivenApiKey(string.Empty);
++
++            Assert.Throws<TvdbApiKeyMissingException>(() =>
++                Subject.ApplyOrdering(TvdbOrderingIds.Alternate, 81189, new List<Episode> { Episode(11, 1, 1) }));
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/Configuration/ConfigService.cs b/src/NzbDrone.Core/Configuration/ConfigService.cs
+index d03dd37..927992f 100644
+--- a/src/NzbDrone.Core/Configuration/ConfigService.cs
++++ b/src/NzbDrone.Core/Configuration/ConfigService.cs
+@@ -189,6 +189,20 @@ public string TmdbApiKey
+             set { SetValue("TmdbApiKey", value); }
+         }
+ 
++        public string TvdbApiKey
++        {
++            get { return GetValue("TvdbApiKey", string.Empty); }
++
++            set { SetValue("TvdbApiKey", value); }
++        }
++
++        public string TvdbPin
++        {
++            get { return GetValue("TvdbPin", string.Empty); }
++
++            set { SetValue("TvdbPin", value); }
++        }
++
+         public bool EnableMultiSeasonReleases
+         {
+             get { return GetValueBoolean("EnableMultiSeasonReleases", true); }
+diff --git a/src/NzbDrone.Core/Configuration/IConfigService.cs b/src/NzbDrone.Core/Configuration/IConfigService.cs
+index d383989..72939a6 100644
+--- a/src/NzbDrone.Core/Configuration/IConfigService.cs
++++ b/src/NzbDrone.Core/Configuration/IConfigService.cs
+@@ -32,6 +32,8 @@ public interface IConfigService
+ 
+         // Metadata
+         string TmdbApiKey { get; set; }
++        string TvdbApiKey { get; set; }
++        string TvdbPin { get; set; }
+ 
+         // Media Management
+         bool AutoUnmonitorPreviouslyDownloadedEpisodes { get; set; }
+diff --git a/src/NzbDrone.Core/Localization/Core/en.json b/src/NzbDrone.Core/Localization/Core/en.json
+index 6c273fd..5f4fac7 100644
+--- a/src/NzbDrone.Core/Localization/Core/en.json
++++ b/src/NzbDrone.Core/Localization/Core/en.json
+@@ -1361,7 +1361,7 @@
+   "MetadataSourceSettingsLoadError": "Unable to load metadata source settings",
+   "MetadataSourceSettingsSeriesSummary": "Information on where {appName} gets series and episode information",
+   "MetadataSourceTmdbDescription": "Artwork, alternate episode orderings such as absolute numbering, and IMDb IDs. Requires a free API key below.",
+-  "MetadataSourceTvdbDescription": "The default. Best coverage of the scene naming that indexers rely on.",
++  "MetadataSourceTvdbDescription": "The default. Best coverage of the scene naming that indexers rely on. Its absolute and alternate episode orders need a TheTVDB API key below.",
+   "MetadataSources": "Sources",
+   "MetadataSourcesInfo": "Each series uses one source, chosen from the dropdown above the search box when you add it. This page describes what each is best at.",
+   "MetadataXmbcSettingsEpisodeMetadataImageThumbsHelpText": "Include image thumb tags in <filename>.nfo (Requires 'Episode Metadata')",
+@@ -2348,6 +2348,10 @@
+   "TrustedNetworks": "Trusted Networks",
+   "TrustedNetworksHelpText": "Comma separated list of IP addresses or networks in CIDR notation that trusted reverse proxies are on. e.g. 172.17.0.1, 10.0.0.0/8 or fc00::/7. Only add proxies that are properly configured to send the correct headers.",
+   "Tuesday": "Tuesday",
++  "TvdbApiKey": "TheTVDB API Key",
++  "TvdbApiKeyHelpText": "Your personal TheTVDB v4 API key. Only needed for the absolute and alternate episode orders, which the default TheTVDB lookup does not carry. Everything else on TheTVDB works without one",
++  "TvdbPin": "TheTVDB PIN",
++  "TvdbPinHelpText": "The PIN TheTVDB issues with a user-supported key. Leave blank if your key does not come with one",
+   "TvdbId": "TVDB ID",
+   "TvdbIdExcludeHelpText": "The TVDB ID of the series to exclude",
+   "Twitter": "Twitter",
+diff --git a/src/NzbDrone.Core/MetadataSource/SkyHook/SkyHookProxy.cs b/src/NzbDrone.Core/MetadataSource/SkyHook/SkyHookProxy.cs
+index fbd496b..8c30689 100644
+--- a/src/NzbDrone.Core/MetadataSource/SkyHook/SkyHookProxy.cs
++++ b/src/NzbDrone.Core/MetadataSource/SkyHook/SkyHookProxy.cs
+@@ -13,6 +13,7 @@
+ using NzbDrone.Core.Languages;
+ using NzbDrone.Core.MediaCover;
+ using NzbDrone.Core.MetadataSource.SkyHook.Resource;
++using NzbDrone.Core.MetadataSource.Tvdb;
+ using NzbDrone.Core.Parser;
+ using NzbDrone.Core.Tv;
+ 
+@@ -27,11 +28,13 @@ public class SkyHookProxy : IProvideSeriesInfo, ISearchForNewSeries, IMetadataPr
+         private readonly ISeriesService _seriesService;
+         private readonly IDailySeriesService _dailySeriesService;
+         private readonly IHttpRequestBuilderFactory _requestBuilder;
++        private readonly IProvideTvdbOrdering _tvdbOrdering;
+ 
+         public SkyHookProxy(IHttpClient httpClient,
+                             ISonarrCloudRequestBuilder requestBuilder,
+                             ISeriesService seriesService,
+                             IDailySeriesService dailySeriesService,
++                            IProvideTvdbOrdering tvdbOrdering,
+                             Logger logger)
+         {
+             _httpClient = httpClient;
+@@ -39,12 +42,54 @@ public class SkyHookProxy : IProvideSeriesInfo, ISearchForNewSeries, IMetadataPr
+             _logger = logger;
+             _seriesService = seriesService;
+             _dailySeriesService = dailySeriesService;
++            _tvdbOrdering = tvdbOrdering;
+             _requestBuilder = requestBuilder.SkyHookTvdb;
+         }
+ 
+         public Tuple<Series, List<Episode>> GetSeriesInfo(Series series)
+         {
+-            return GetSeriesInfo(series.TvdbId);
++            var tuple = GetSeriesInfo(series.TvdbId);
++
++            // SkyHook only publishes the aired order. A series added with one of TheTVDB's
++            // other orders is renumbered here, on add and on every refresh, so its episodes
++            // keep the numbering its files were named with.
++            if (TvdbOrderingIds.IsTvdbOrdering(series.OrderingId))
++            {
++                var episodes = _tvdbOrdering.ApplyOrdering(series.OrderingId, series.TvdbId, tuple.Item2);
++
++                tuple.Item1.OrderingId = series.OrderingId;
++                SetSeasons(tuple.Item1, episodes);
++
++                return new Tuple<Series, List<Episode>>(tuple.Item1, episodes);
++            }
++
++            return tuple;
++        }
++
++        /// <summary>
++        /// Rebuilds the season list from the renumbered episodes, since the seasons SkyHook
++        /// returned describe the aired order. A season that survives keeps whatever monitored
++        /// state it was given, and new ones are monitored unless they are specials.
++        /// </summary>
++        private static void SetSeasons(Series series, List<Episode> episodes)
++        {
++            var existing = series.Seasons?.ToDictionary(s => s.SeasonNumber) ?? new Dictionary<int, Season>();
++
++            series.Seasons = episodes.Select(e => e.SeasonNumber)
++                                     .Distinct()
++                                     .OrderBy(number => number)
++                                     .Select(number =>
++                                     {
++                                         var found = existing.TryGetValue(number, out var previous);
++
++                                         return new Season
++                                         {
++                                             SeasonNumber = number,
++                                             Images = found ? previous.Images : new List<MediaCover.MediaCover>(),
++                                             Monitored = found ? previous.Monitored : number > 0
++                                         };
++                                     })
++                                     .ToList();
+         }
+ 
+         public Tuple<Series, List<Episode>> GetSeriesInfo(int tvdbSeriesId)
+diff --git a/src/NzbDrone.Core/MetadataSource/Tvdb/Resource/TvdbResources.cs b/src/NzbDrone.Core/MetadataSource/Tvdb/Resource/TvdbResources.cs
+new file mode 100644
+index 0000000..f5a6f2e
+--- /dev/null
++++ b/src/NzbDrone.Core/MetadataSource/Tvdb/Resource/TvdbResources.cs
+@@ -0,0 +1,57 @@
++using System.Collections.Generic;
++using Newtonsoft.Json;
++
++namespace NzbDrone.Core.MetadataSource.Tvdb.Resource
++{
++    // The HTTP client deserializes with Newtonsoft, so every field is named explicitly with
++    // JsonProperty. See AGENTS.md: System.Text.Json attributes are ignored without an error.
++
++    /// <summary>
++    /// Response of POST /login.
++    /// </summary>
++    public class TvdbLoginResponse
++    {
++        [JsonProperty("data")]
++        public TvdbLoginData Data { get; set; }
++    }
++
++    public class TvdbLoginData
++    {
++        [JsonProperty("token")]
++        public string Token { get; set; }
++    }
++
++    /// <summary>
++    /// Response of GET /series/{id}/episodes/{season-type}, one page at a time.
++    /// </summary>
++    public class TvdbEpisodesResponse
++    {
++        [JsonProperty("data")]
++        public TvdbEpisodesData Data { get; set; }
++    }
++
++    public class TvdbEpisodesData
++    {
++        [JsonProperty("episodes")]
++        public List<TvdbEpisodeResource> Episodes { get; set; }
++    }
++
++    public class TvdbEpisodeResource
++    {
++        /// <summary>
++        /// TheTVDB's episode id. This is the same id SkyHook reports as the episode's TvdbId,
++        /// which is what lets an ordering be laid over the episodes already fetched.
++        /// </summary>
++        [JsonProperty("id")]
++        public int Id { get; set; }
++
++        [JsonProperty("seasonNumber")]
++        public int SeasonNumber { get; set; }
++
++        [JsonProperty("number")]
++        public int Number { get; set; }
++
++        [JsonProperty("absoluteNumber")]
++        public int? AbsoluteNumber { get; set; }
++    }
++}
+diff --git a/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbApiKeyMissingException.cs b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbApiKeyMissingException.cs
+new file mode 100644
+index 0000000..828670c
+--- /dev/null
++++ b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbApiKeyMissingException.cs
+@@ -0,0 +1,17 @@
++using NzbDrone.Common.Exceptions;
++
++namespace NzbDrone.Core.MetadataSource.Tvdb
++{
++    public class TvdbApiKeyMissingException : NzbDroneException
++    {
++        public TvdbApiKeyMissingException()
++            : base("No TheTVDB API key is configured. Add one in Settings to use TheTVDB's absolute and alternate episode orders.")
++        {
++        }
++
++        public TvdbApiKeyMissingException(string message)
++            : base(message)
++        {
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingIds.cs b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingIds.cs
+new file mode 100644
+index 0000000..abab482
+--- /dev/null
++++ b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingIds.cs
+@@ -0,0 +1,51 @@
++using System;
++
++namespace NzbDrone.Core.MetadataSource.Tvdb
++{
++    /// <summary>
++    /// The ordering ids a TheTVDB-owned series can be added with, and the TheTVDB season
++    /// type each one stands for.
++    /// <para>
++    /// The aired order is not listed: it is the default, stored as no ordering at all, and
++    /// is what SkyHook returns without any renumbering.
++    /// </para>
++    /// <para>
++    /// The ids carry a prefix so they can never be mistaken for a TMDB episode group id
++    /// (an opaque hex string) or the IMDb ordering id.
++    /// </para>
++    /// </summary>
++    public static class TvdbOrderingIds
++    {
++        public const string Absolute = "tvdb-absolute";
++        public const string Alternate = "tvdb-alternate";
++
++        public static bool IsTvdbOrdering(string orderingId)
++        {
++            return ToSeasonType(orderingId) != null;
++        }
++
++        public static bool IsAbsolute(string orderingId)
++        {
++            return string.Equals(orderingId, Absolute, StringComparison.Ordinal);
++        }
++
++        /// <summary>
++        /// The value TheTVDB's v4 API expects as the <c>season-type</c> path segment, or null
++        /// when the id is not one of ours.
++        /// </summary>
++        public static string ToSeasonType(string orderingId)
++        {
++            if (string.Equals(orderingId, Absolute, StringComparison.Ordinal))
++            {
++                return "absolute";
++            }
++
++            if (string.Equals(orderingId, Alternate, StringComparison.Ordinal))
++            {
++                return "alternate";
++            }
++
++            return null;
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingProjector.cs b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingProjector.cs
+new file mode 100644
+index 0000000..c762b68
+--- /dev/null
++++ b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingProjector.cs
+@@ -0,0 +1,105 @@
++using System.Collections.Generic;
++using System.Linq;
++using NzbDrone.Core.MetadataSource.Tvdb.Resource;
++using NzbDrone.Core.Tv;
++
++namespace NzbDrone.Core.MetadataSource.Tvdb
++{
++    /// <summary>
++    /// Renumbers episodes according to one of TheTVDB's alternative season types.
++    /// <para>
++    /// Kept free of HTTP and state so the renumbering can be tested directly: it decides
++    /// what ends up in file names, and getting it wrong misfiles a library.
++    /// </para>
++    /// </summary>
++    public static class TvdbOrderingProjector
++    {
++        /// <summary>
++        /// Lays an ordering over episodes matched by TheTVDB episode id.
++        /// <para>
++        /// An absolute ordering is one continuous run, so every listed episode goes into
++        /// season 1 numbered by its absolute number. Any other ordering takes the season and
++        /// episode numbers TheTVDB lists for it.
++        /// </para>
++        /// <para>
++        /// Episodes the ordering does not list are never dropped, since that would orphan any
++        /// file already matched to them. They keep their existing numbering, unless another
++        /// episode now holds that slot, in which case they move to the end of season 0. Two
++        /// episodes sharing a season and episode number would otherwise break matching and
++        /// the next refresh.
++        /// </para>
++        /// The input list's order is preserved.
++        /// </summary>
++        public static List<Episode> Project(string orderingId, IEnumerable<TvdbEpisodeResource> listed, List<Episode> episodes)
++        {
++            var isAbsolute = TvdbOrderingIds.IsAbsolute(orderingId);
++
++            var byTvdbId = new Dictionary<int, Episode>();
++
++            foreach (var episode in episodes)
++            {
++                if (episode.TvdbId > 0)
++                {
++                    byTvdbId.TryAdd(episode.TvdbId, episode);
++                }
++            }
++
++            var claimed = new HashSet<Episode>();
++            var taken = new HashSet<(int Season, int Number)>();
++
++            foreach (var entry in (listed ?? Enumerable.Empty<TvdbEpisodeResource>())
++                         .OrderBy(e => isAbsolute ? 1 : e.SeasonNumber)
++                         .ThenBy(e => isAbsolute ? e.AbsoluteNumber ?? e.Number : e.Number))
++            {
++                if (!byTvdbId.TryGetValue(entry.Id, out var episode) || claimed.Contains(episode))
++                {
++                    continue;
++                }
++
++                var season = isAbsolute ? 1 : entry.SeasonNumber;
++                var number = isAbsolute ? entry.AbsoluteNumber ?? entry.Number : entry.Number;
++
++                // TheTVDB lists some episodes in an alternative ordering without a usable
++                // number. Leaving those with their own numbering is safer than inventing one,
++                // and a slot already held by another listed episode is not shared.
++                if (number <= 0 || !taken.Add((season, number)))
++                {
++                    continue;
++                }
++
++                episode.SeasonNumber = season;
++                episode.EpisodeNumber = number;
++
++                if (isAbsolute)
++                {
++                    episode.AbsoluteEpisodeNumber = number;
++                }
++
++                claimed.Add(episode);
++            }
++
++            // Two passes over the leftovers. First, every one that can keep its own slot does,
++            // so a real special is never displaced by a collision elsewhere. Only then are the
++            // colliding ones moved, to numbers above everything already in season 0.
++            var moved = new List<Episode>();
++
++            foreach (var episode in episodes.Where(e => !claimed.Contains(e)))
++            {
++                if (!taken.Add((episode.SeasonNumber, episode.EpisodeNumber)))
++                {
++                    moved.Add(episode);
++                }
++            }
++
++            var nextSpecial = taken.Where(t => t.Season == 0).Select(t => t.Number).DefaultIfEmpty(0).Max() + 1;
++
++            foreach (var episode in moved)
++            {
++                episode.SeasonNumber = 0;
++                episode.EpisodeNumber = nextSpecial++;
++            }
++
++            return episodes;
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingProvider.cs b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingProvider.cs
+new file mode 100644
+index 0000000..0ae2ec1
+--- /dev/null
++++ b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingProvider.cs
+@@ -0,0 +1,312 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Net;
++using System.Net.Http;
++using NLog;
++using NzbDrone.Common.Cache;
++using NzbDrone.Common.Extensions;
++using NzbDrone.Common.Http;
++using NzbDrone.Common.Serializer;
++using NzbDrone.Core.Configuration;
++using NzbDrone.Core.MetadataSource.Ordering;
++using NzbDrone.Core.MetadataSource.Tvdb.Resource;
++using NzbDrone.Core.Tv;
++
++namespace NzbDrone.Core.MetadataSource.Tvdb
++{
++    public interface IProvideTvdbOrdering
++    {
++        /// <summary>
++        /// The orderings TheTVDB can supply for a series: the default aired order, followed by
++        /// whichever of its absolute and alternate orders actually list episodes. Empty when
++        /// there is no API key or TheTVDB has nothing beyond the aired order, so the caller
++        /// offers no choice rather than a pointless one.
++        /// </summary>
++        List<EpisodeOrdering> GetOrderings(int tvdbId);
++
++        /// <summary>
++        /// Renumbers episodes (as returned by SkyHook) into one of this provider's orderings.
++        /// Throws rather than falling back to the aired order, because a silent fallback
++        /// would renumber, and so rename, an existing library on the next refresh.
++        /// </summary>
++        List<Episode> ApplyOrdering(string orderingId, int tvdbId, List<Episode> episodes);
++    }
++
++    /// <summary>
++    /// Offers TheTVDB's absolute and alternate episode orders for series it owns.
++    /// <para>
++    /// SkyHook, the proxy the default TheTVDB lookup goes through, only publishes the aired
++    /// order. The other season types live in TheTVDB's own v4 API, which needs a key of the
++    /// user's own, the same arrangement as TMDB.
++    /// </para>
++    /// </summary>
++    public class TvdbOrderingProvider : IProvideTvdbOrdering
++    {
++        private const string BaseUrl = "https://api4.thetvdb.com/v4";
++
++        // A page holds hundreds of episodes. The cap only exists so a misbehaving response
++        // that never ends cannot loop forever.
++        private const int MaxPages = 40;
++
++        // The API documents a one month token. Refreshed far sooner than that so a stale
++        // one is rare, and again immediately if a request is refused as unauthorized.
++        private static readonly TimeSpan TokenLifetime = TimeSpan.FromHours(12);
++
++        // Long enough that applying an ordering straight after listing it does not fetch
++        // everything twice, short enough that a change on TheTVDB shows up the same day.
++        private static readonly TimeSpan EpisodeLifetime = TimeSpan.FromMinutes(10);
++
++        private readonly IHttpClient _httpClient;
++        private readonly IConfigService _configService;
++        private readonly ICached<string> _tokenCache;
++        private readonly ICached<List<TvdbEpisodeResource>> _episodeCache;
++        private readonly Logger _logger;
++
++        public TvdbOrderingProvider(IHttpClient httpClient,
++                                    IConfigService configService,
++                                    ICacheManager cacheManager,
++                                    Logger logger)
++        {
++            _httpClient = httpClient;
++            _configService = configService;
++            _tokenCache = cacheManager.GetCache<string>(GetType(), "token");
++            _episodeCache = cacheManager.GetCache<List<TvdbEpisodeResource>>(GetType(), "episodes");
++            _logger = logger;
++        }
++
++        public List<EpisodeOrdering> GetOrderings(int tvdbId)
++        {
++            var orderings = new List<EpisodeOrdering>();
++
++            if (tvdbId <= 0 || _configService.TvdbApiKey.IsNullOrWhiteSpace())
++            {
++                return orderings;
++            }
++
++            try
++            {
++                var absolute = GetEpisodes(tvdbId, TvdbOrderingIds.Absolute);
++
++                if (absolute.Count > 0)
++                {
++                    orderings.Add(new EpisodeOrdering
++                    {
++                        Id = TvdbOrderingIds.Absolute,
++                        Name = "TheTVDB Absolute Order",
++                        Description = "Every episode numbered in one continuous run, as published by TheTVDB.",
++                        EpisodeCount = absolute.Count,
++                        SeasonCount = 1,
++                        IsAbsolute = true
++                    });
++                }
++
++                var alternate = GetEpisodes(tvdbId, TvdbOrderingIds.Alternate);
++
++                if (alternate.Count > 0)
++                {
++                    orderings.Add(new EpisodeOrdering
++                    {
++                        Id = TvdbOrderingIds.Alternate,
++                        Name = "TheTVDB Alternate Order",
++                        Description = "The alternate season and episode numbering published by TheTVDB.",
++                        EpisodeCount = alternate.Count,
++                        SeasonCount = alternate.Select(e => e.SeasonNumber).Distinct().Count(),
++                        IsAbsolute = false
++                    });
++                }
++            }
++            catch (Exception ex)
++            {
++                // An unavailable list should not stop the series being added with the aired
++                // order, so the choice just does not appear.
++                _logger.Debug(ex, "Unable to fetch TheTVDB episode orderings for {0}", tvdbId);
++
++                return new List<EpisodeOrdering>();
++            }
++
++            if (orderings.Count > 0)
++            {
++                orderings.Insert(0, new EpisodeOrdering
++                {
++                    Id = null,
++                    Name = "Default (Aired order)",
++                    Description = "The season and episode numbering TheTVDB lists by default."
++                });
++            }
++
++            return orderings;
++        }
++
++        public List<Episode> ApplyOrdering(string orderingId, int tvdbId, List<Episode> episodes)
++        {
++            if (!TvdbOrderingIds.IsTvdbOrdering(orderingId))
++            {
++                return episodes;
++            }
++
++            try
++            {
++                var listed = GetEpisodes(tvdbId, orderingId);
++
++                if (listed.Count == 0)
++                {
++                    throw new TvdbOrderingUnavailableException(TvdbOrderingIds.ToSeasonType(orderingId), tvdbId);
++                }
++
++                return TvdbOrderingProjector.Project(orderingId, listed, episodes);
++            }
++            catch (Exception ex)
++            {
++                // Renumbering against a missing or half-fetched ordering would scramble the
++                // library, so surface the failure and let the refresh keep what is on disk.
++                _logger.Error(ex, "Unable to apply TheTVDB episode ordering {0}, keeping existing numbering", orderingId);
++
++                throw;
++            }
++        }
++
++        private List<TvdbEpisodeResource> GetEpisodes(int tvdbId, string orderingId)
++        {
++            var seasonType = TvdbOrderingIds.ToSeasonType(orderingId);
++
++            return _episodeCache.Get($"{tvdbId}:{seasonType}", () => FetchEpisodes(tvdbId, seasonType), EpisodeLifetime);
++        }
++
++        private List<TvdbEpisodeResource> FetchEpisodes(int tvdbId, string seasonType)
++        {
++            var episodes = new List<TvdbEpisodeResource>();
++            var seen = new HashSet<int>();
++
++            for (var page = 0; page < MaxPages; page++)
++            {
++                var response = Get<TvdbEpisodesResponse>($"/series/{tvdbId}/episodes/{seasonType}", page);
++
++                var pageEpisodes = response?.Data?.Episodes;
++
++                if (pageEpisodes == null || pageEpisodes.Count == 0)
++                {
++                    break;
++                }
++
++                var added = 0;
++
++                foreach (var episode in pageEpisodes)
++                {
++                    if (seen.Add(episode.Id))
++                    {
++                        episodes.Add(episode);
++                        added++;
++                    }
++                }
++
++                // A page that adds nothing new means the API is repeating itself rather than
++                // running out, which is as good as the end.
++                if (added == 0)
++                {
++                    break;
++                }
++            }
++
++            return episodes;
++        }
++
++        /// <summary>
++        /// A 404 means TheTVDB has no such season type for the series, which is the normal
++        /// case for most series and most types, so it is an empty answer and not an error.
++        /// </summary>
++        private T Get<T>(string resource, int page, bool isRetry = false)
++            where T : class, new()
++        {
++            var apiKey = _configService.TvdbApiKey;
++
++            if (apiKey.IsNullOrWhiteSpace())
++            {
++                throw new TvdbApiKeyMissingException();
++            }
++
++            var request = new HttpRequestBuilder(BaseUrl + resource)
++                .AddQueryParam("page", page.ToString())
++                .SetHeader("Authorization", "Bearer " + GetToken(apiKey, _configService.TvdbPin))
++                .Build();
++
++            request.AllowAutoRedirect = true;
++            request.SuppressHttpError = true;
++
++            var response = _httpClient.Get<T>(request);
++
++            if (response.HasHttpError)
++            {
++                if (response.StatusCode == HttpStatusCode.NotFound)
++                {
++                    return new T();
++                }
++
++                if (response.StatusCode == HttpStatusCode.Unauthorized && !isRetry)
++                {
++                    // The cached token has expired or been revoked. Log in afresh once.
++                    _tokenCache.Remove(TokenCacheKey(apiKey, _configService.TvdbPin));
++
++                    return Get<T>(resource, page, true);
++                }
++
++                if (response.StatusCode == HttpStatusCode.Unauthorized)
++                {
++                    throw new TvdbApiKeyMissingException("The configured TheTVDB API key was rejected");
++                }
++
++                throw new HttpException(request, response);
++            }
++
++            return response.Resource;
++        }
++
++        private string GetToken(string apiKey, string pin)
++        {
++            return _tokenCache.Get(TokenCacheKey(apiKey, pin), () => Login(apiKey, pin), TokenLifetime);
++        }
++
++        // Keyed by the key and PIN themselves so changing either in Settings does not keep
++        // serving a token issued for the old ones. Only ever held in process memory.
++        private static string TokenCacheKey(string apiKey, string pin)
++        {
++            return "token:" + apiKey.GetHashCode() + ":" + (pin ?? string.Empty).GetHashCode();
++        }
++
++        private string Login(string apiKey, string pin)
++        {
++            var request = new HttpRequestBuilder(BaseUrl + "/login").Build();
++
++            request.Method = HttpMethod.Post;
++            request.Headers.ContentType = "application/json";
++            request.SuppressHttpError = true;
++
++            // TheTVDB documents the PIN as needed only for user-supported keys, so it is sent
++            // only when one has been entered.
++            request.SetContent(pin.IsNullOrWhiteSpace()
++                ? Json.ToJson(new { apikey = apiKey })
++                : Json.ToJson(new { apikey = apiKey, pin }));
++
++            var response = _httpClient.Post<TvdbLoginResponse>(request);
++
++            if (response.HasHttpError)
++            {
++                if (response.StatusCode == HttpStatusCode.Unauthorized)
++                {
++                    throw new TvdbApiKeyMissingException("The configured TheTVDB API key was rejected");
++                }
++
++                throw new HttpException(request, response);
++            }
++
++            var token = response.Resource?.Data?.Token;
++
++            if (token.IsNullOrWhiteSpace())
++            {
++                throw new TvdbApiKeyMissingException("TheTVDB accepted the login but returned no token");
++            }
++
++            return token;
++        }
++    }
++}
+diff --git a/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingUnavailableException.cs b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingUnavailableException.cs
+new file mode 100644
+index 0000000..6ac9ca1
+--- /dev/null
++++ b/src/NzbDrone.Core/MetadataSource/Tvdb/TvdbOrderingUnavailableException.cs
+@@ -0,0 +1,17 @@
++using NzbDrone.Common.Exceptions;
++
++namespace NzbDrone.Core.MetadataSource.Tvdb
++{
++    /// <summary>
++    /// A series was added with one of TheTVDB's alternative orders, but TheTVDB no longer
++    /// lists that order. Raised instead of falling back to the aired order, because the
++    /// fallback would renumber the series and so rename its files.
++    /// </summary>
++    public class TvdbOrderingUnavailableException : NzbDroneException
++    {
++        public TvdbOrderingUnavailableException(string seasonType, int tvdbId)
++            : base("TheTVDB no longer lists a {0} episode order for series {1}", seasonType, tvdbId)
++        {
++        }
++    }
++}
+diff --git a/src/Sonarr.Api.V5/Series/EpisodeOrderingController.cs b/src/Sonarr.Api.V5/Series/EpisodeOrderingController.cs
+index 125d26d..bdf0bf4 100644
+--- a/src/Sonarr.Api.V5/Series/EpisodeOrderingController.cs
++++ b/src/Sonarr.Api.V5/Series/EpisodeOrderingController.cs
+@@ -3,6 +3,7 @@
+ using Microsoft.AspNetCore.Mvc;
+ using NzbDrone.Core.MetadataSource.Imdb;
+ using NzbDrone.Core.MetadataSource.Tmdb;
++using NzbDrone.Core.MetadataSource.Tvdb;
+ using Sonarr.Http;
+ 
+ namespace Sonarr.Api.V5.Series;
+@@ -19,15 +20,17 @@ public class EpisodeOrderingController : Controller
+ {
+     private readonly IProvideEpisodeOrderings _orderingProvider;
+     private readonly IProvideImdbOrdering _imdbOrdering;
++    private readonly IProvideTvdbOrdering _tvdbOrdering;
+ 
+-    public EpisodeOrderingController(IProvideEpisodeOrderings orderingProvider, IProvideImdbOrdering imdbOrdering)
++    public EpisodeOrderingController(IProvideEpisodeOrderings orderingProvider, IProvideImdbOrdering imdbOrdering, IProvideTvdbOrdering tvdbOrdering)
+     {
+         _orderingProvider = orderingProvider;
+         _imdbOrdering = imdbOrdering;
++        _tvdbOrdering = tvdbOrdering;
+     }
+ 
+     [HttpGet]
+-    public Ok<List<EpisodeOrderingResource>> GetOrderings([FromQuery] int tmdbId, [FromQuery] string? imdbId = null)
++    public Ok<List<EpisodeOrderingResource>> GetOrderings([FromQuery] int tmdbId, [FromQuery] string? imdbId = null, [FromQuery] int tvdbId = 0)
+     {
+         var orderings = new List<EpisodeOrderingResource>();
+ 
+@@ -48,6 +51,23 @@ public Ok<List<EpisodeOrderingResource>> GetOrderings([FromQuery] int tmdbId, [F
+             orderings.Add(imdb.ToResource());
+         }
+ 
++        // Only asked about for a series TheTVDB owns, since these orderings are applied by the
++        // TheTVDB provider and would do nothing for a series owned by another one. Empty
++        // without a TheTVDB API key, or when TheTVDB lists nothing beyond the aired order.
++        // Its own default entry is dropped when another source already supplied one.
++        if (tvdbId > 0)
++        {
++            foreach (var ordering in _tvdbOrdering.GetOrderings(tvdbId))
++            {
++                if (ordering.IsDefault && orderings.Any(o => o.IsDefault))
++                {
++                    continue;
++                }
++
++                orderings.Add(ordering.ToResource());
++            }
++        }
++
+         return TypedResults.Ok(orderings);
+     }
+ }
+diff --git a/src/Sonarr.Api.V5/Settings/MetadataSourceSettingsController.cs b/src/Sonarr.Api.V5/Settings/MetadataSourceSettingsController.cs
+index 742c982..f97a08c 100644
+--- a/src/Sonarr.Api.V5/Settings/MetadataSourceSettingsController.cs
++++ b/src/Sonarr.Api.V5/Settings/MetadataSourceSettingsController.cs
+@@ -41,6 +41,20 @@ protected override MetadataSourceSettingsResource ToResource(IConfigFileProvider
+                 : resource.TmdbApiKey.Trim();
+         }
+ 
++        if (resource.TvdbApiKey != MetadataSourceSettingsResource.Mask)
++        {
++            _configService.TvdbApiKey = resource.TvdbApiKey.IsNullOrWhiteSpace()
++                ? string.Empty
++                : resource.TvdbApiKey.Trim();
++        }
++
++        if (resource.TvdbPin != MetadataSourceSettingsResource.Mask)
++        {
++            _configService.TvdbPin = resource.TvdbPin.IsNullOrWhiteSpace()
++                ? string.Empty
++                : resource.TvdbPin.Trim();
++        }
++
+         return TypedAccepted(resource.Id);
+     }
+ }
+diff --git a/src/Sonarr.Api.V5/Settings/MetadataSourceSettingsResource.cs b/src/Sonarr.Api.V5/Settings/MetadataSourceSettingsResource.cs
+index 5d6aa2a..4f3abea 100644
+--- a/src/Sonarr.Api.V5/Settings/MetadataSourceSettingsResource.cs
++++ b/src/Sonarr.Api.V5/Settings/MetadataSourceSettingsResource.cs
+@@ -23,6 +23,23 @@ public class MetadataSourceSettingsResource : RestResource
+     /// cannot tell the difference from a blank one.
+     /// </summary>
+     public bool TmdbApiKeyConfigured { get; set; }
++
++    /// <summary>
++    /// User-supplied TheTVDB v4 API key, needed only for TheTVDB's absolute and alternate
++    /// episode orders. SkyHook serves everything else without one. Masked once saved, like
++    /// the TMDB key.
++    /// </summary>
++    public string? TvdbApiKey { get; set; }
++
++    public bool TvdbApiKeyConfigured { get; set; }
++
++    /// <summary>
++    /// The PIN TheTVDB issues with a user-supported key. Blank for a project key. Masked once
++    /// saved.
++    /// </summary>
++    public string? TvdbPin { get; set; }
++
++    public bool TvdbPinConfigured { get; set; }
+ }
+ 
+ public static class MetadataSourceSettingsResourceMapper
+@@ -30,11 +47,17 @@ public static class MetadataSourceSettingsResourceMapper
+     public static MetadataSourceSettingsResource ToResource(IConfigService model)
+     {
+         var configured = model.TmdbApiKey.IsNotNullOrWhiteSpace();
++        var tvdbConfigured = model.TvdbApiKey.IsNotNullOrWhiteSpace();
++        var pinConfigured = model.TvdbPin.IsNotNullOrWhiteSpace();
+ 
+         return new MetadataSourceSettingsResource
+         {
+             TmdbApiKey = configured ? MetadataSourceSettingsResource.Mask : string.Empty,
+-            TmdbApiKeyConfigured = configured
++            TmdbApiKeyConfigured = configured,
++            TvdbApiKey = tvdbConfigured ? MetadataSourceSettingsResource.Mask : string.Empty,
++            TvdbApiKeyConfigured = tvdbConfigured,
++            TvdbPin = pinConfigured ? MetadataSourceSettingsResource.Mask : string.Empty,
++            TvdbPinConfigured = pinConfigured
+         };
+     }
+ }
+-- 
+2.43.0
+

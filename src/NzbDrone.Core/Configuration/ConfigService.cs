@@ -189,6 +189,20 @@ namespace NzbDrone.Core.Configuration
             set { SetValue("TmdbApiKey", value); }
         }
 
+        public string TvdbApiKey
+        {
+            get { return GetValue("TvdbApiKey", string.Empty); }
+
+            set { SetValue("TvdbApiKey", value); }
+        }
+
+        public string TvdbPin
+        {
+            get { return GetValue("TvdbPin", string.Empty); }
+
+            set { SetValue("TvdbPin", value); }
+        }
+
         public bool EnableMultiSeasonReleases
         {
             get { return GetValueBoolean("EnableMultiSeasonReleases", true); }

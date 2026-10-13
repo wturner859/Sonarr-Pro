@@ -17,7 +17,7 @@ preserve the fork's existing migrations 233–235.
 
 ## Turn-on checklist
 
-Three things need doing before the new features do anything.
+Four things need doing before the new features do anything.
 
 1. **TMDB API key** — Settings → Metadata Source. Free from
    <https://www.themoviedb.org/settings/api>. Without it, TMDB metadata and
@@ -29,6 +29,9 @@ Three things need doing before the new features do anything.
    ever happens because someone asked for it.
 3. **Skip Unmonitored Episodes In Packs** — Settings → Media Management, off by
    default. See below for why.
+4. **TheTVDB API key** (optional) — Settings → Metadata Source. Only needed for
+   TheTVDB's absolute and alternate orders. A user-supported key also needs its
+   PIN. Without a key the ordering dropdown simply does not list them.
 
 Nothing else needs configuring.
 
@@ -107,6 +110,28 @@ remove the series and add it again.
 Episodes an ordering does not mention keep their original numbering rather than
 being dropped, so nothing already matched to a file is lost. For One Piece that
 is 39 specials, kept in season 0.
+
+### TheTVDB's own orders
+
+SkyHook, the proxy behind the default TheTVDB lookup, only publishes the aired
+order. TheTVDB itself also keeps *absolute* and *alternate* season types, which
+are only reachable through its v4 API and a key of the user's own. With a key
+saved, a series TheTVDB owns gets those two added to the dropdown, next to the
+default aired order, whenever TheTVDB actually lists episodes for them.
+
+They are applied inside `SkyHookProxy`, on add and on every refresh, by laying
+TheTVDB's numbering over the SkyHook episodes by TheTVDB episode id. Two
+deliberate differences from the TMDB path:
+
+- **A vanished ordering is an error, not a fallback.** If TheTVDB stops listing
+  the order a series was added with, the refresh fails and the library keeps its
+  numbering. Falling back to aired order would rename it.
+- **An unlisted episode that would share a slot with a listed one moves to the
+  end of season 0.** It is never dropped and never duplicated: two episodes with
+  the same season and episode number break matching on the next refresh.
+
+These orderings are only offered for series TheTVDB owns, because the TheTVDB
+provider is what applies them.
 
 ---
 

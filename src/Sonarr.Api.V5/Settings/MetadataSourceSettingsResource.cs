@@ -23,6 +23,23 @@ public class MetadataSourceSettingsResource : RestResource
     /// cannot tell the difference from a blank one.
     /// </summary>
     public bool TmdbApiKeyConfigured { get; set; }
+
+    /// <summary>
+    /// User-supplied TheTVDB v4 API key, needed only for TheTVDB's absolute and alternate
+    /// episode orders. SkyHook serves everything else without one. Masked once saved, like
+    /// the TMDB key.
+    /// </summary>
+    public string? TvdbApiKey { get; set; }
+
+    public bool TvdbApiKeyConfigured { get; set; }
+
+    /// <summary>
+    /// The PIN TheTVDB issues with a user-supported key. Blank for a project key. Masked once
+    /// saved.
+    /// </summary>
+    public string? TvdbPin { get; set; }
+
+    public bool TvdbPinConfigured { get; set; }
 }
 
 public static class MetadataSourceSettingsResourceMapper
@@ -30,11 +47,17 @@ public static class MetadataSourceSettingsResourceMapper
     public static MetadataSourceSettingsResource ToResource(IConfigService model)
     {
         var configured = model.TmdbApiKey.IsNotNullOrWhiteSpace();
+        var tvdbConfigured = model.TvdbApiKey.IsNotNullOrWhiteSpace();
+        var pinConfigured = model.TvdbPin.IsNotNullOrWhiteSpace();
 
         return new MetadataSourceSettingsResource
         {
             TmdbApiKey = configured ? MetadataSourceSettingsResource.Mask : string.Empty,
-            TmdbApiKeyConfigured = configured
+            TmdbApiKeyConfigured = configured,
+            TvdbApiKey = tvdbConfigured ? MetadataSourceSettingsResource.Mask : string.Empty,
+            TvdbApiKeyConfigured = tvdbConfigured,
+            TvdbPin = pinConfigured ? MetadataSourceSettingsResource.Mask : string.Empty,
+            TvdbPinConfigured = pinConfigured
         };
     }
 }

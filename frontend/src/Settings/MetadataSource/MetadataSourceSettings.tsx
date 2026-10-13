@@ -7,8 +7,8 @@ import {
   SettingsStateChange,
 } from 'typings/Settings/SettingsState';
 import translate from 'Utilities/String/translate';
+import ApiKeys from './ApiKeys';
 import Sources from './Sources';
-import Tmdb from './Tmdb';
 
 function MetadataSourceSettings() {
   const saveOptions = useRef<() => void>();
@@ -46,7 +46,7 @@ function MetadataSourceSettings() {
         />
         <Sources />
 
-        <Tmdb
+        <ApiKeys
           setChildSave={handleSetChildSave}
           onChildStateChange={handleChildStateChange}
         />

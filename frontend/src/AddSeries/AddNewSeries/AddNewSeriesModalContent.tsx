@@ -69,7 +69,16 @@ function AddNewSeriesModalContent({
   // translated back on submit.
   const [orderingId, setOrderingId] = useState('');
 
-  const { data: orderings } = useEpisodeOrderings(series.tmdbId, series.imdbId);
+  // A series added without a metadata source is a TheTVDB one. Series owned by another
+  // source carry a placeholder (zero or negative) TheTVDB id when TheTVDB has no entry.
+  const isTvdbSeries =
+    !series.metadataSource || series.metadataSource.toLowerCase() === 'tvdb';
+
+  const { data: orderings } = useEpisodeOrderings(
+    series.tmdbId,
+    series.imdbId,
+    isTvdbSeries ? Math.max(series.tvdbId, 0) : 0
+  );
 
   const orderingOptions = useMemo(() => {
     return orderings.map((ordering) => ({

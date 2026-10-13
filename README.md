@@ -1,4 +1,7 @@
-# Sonarr Pro
+<div align="center">
+  <img src="Logo/512.png" alt="Sonarr Pro Logo" width="120" />
+  <h1 align="center">Sonarr Pro</h1>
+</div>
 
 A fork of [Sonarr](https://github.com/Sonarr/Sonarr) that adds the metadata and downloading features long-running and anime libraries need, and ships as a single Docker image.
 
